@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Espace confirmateur</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Manrope:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="panel.css">
+<style>
+.split{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:16px;align-items:start}
+.list{display:grid;gap:8px}
+.oc{display:grid;gap:3px;text-align:left;width:100%;background:var(--surface);border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;cursor:pointer}
+.oc:hover{border-color:var(--brand)}
+.oc.on{border-color:var(--brand);background:var(--brand-soft)}
+.oc .r1{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.oc .r2{font-weight:600;overflow-wrap:anywhere}
+.oc .r3{display:flex;gap:12px;color:var(--muted);font-size:13px;flex-wrap:wrap}
+.oc .late{color:var(--accent);font-weight:700}
+.empty{text-align:center;color:var(--muted);padding:40px 16px}
+.phone{display:inline-flex;align-items:center;gap:8px;font-family:var(--f-display);font-size:24px;font-weight:700;color:var(--brand);text-decoration:none}
+.acts{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:6px}
+.acts .full{grid-column:1/-1}
+.head2{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px}
+.back{display:none}
+.mine-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+@media (max-width:860px){
+  .split{grid-template-columns:1fr}
+  #detail{position:fixed;inset:0;z-index:30;background:var(--bg);overflow:auto;padding:14px;transform:translateX(100%);transition:transform .2s}
+  #detail.open{transform:none}
+  .back{display:inline-flex;margin-bottom:10px}
+  .acts{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div id="auth" hidden></div>
+<div id="app" hidden>
+  <header class="top">
+    <div class="in">
+      <div class="logo" id="brandLogo"></div>
+      <div class="grow"></div>
+      <span class="who" id="who"></span>
+      <button class="btn grey sm" id="refresh">Actualiser</button>
+      <button class="btn grey sm" id="logoutBtn">Déconnexion</button>
+    </div>
+    <div class="tabs" id="tabs" role="tablist"></div>
+  </header>
+  <main class="page">
+    <div class="mine-bar" id="queueBar" hidden>
+      <button class="btn" id="takeNext">Prendre la prochaine commande</button>
+      <span class="note">Les commandes de la file d'attente ne sont attribuées à personne.</span>
+    </div>
+    <div class="split">
+      <div class="list" id="list"></div>
+      <section class="card" id="detail" aria-live="polite"></section>
+    </div>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+let me = null, orders = [], tab = "todo", selId = null, events = [];
+const OPEN = ["nouvelle", "pas_de_reponse", "reportee"];
+const DONE = ["confirmee", "expediee", "livree", "retournee"];
+const mine = o => o.assigned_to === me.id;
+const FILTERS = {
+  queue: o => !o.assigned_to && o.status === "nouvelle",
+  todo: o => mine(o) && OPEN.includes(o.status),
+  done: o => mine(o) && DONE.includes(o.status),
+  cancel: o => mine(o) && o.status === "annulee"
+};
+const TABS = [["queue", "File d'attente"], ["todo", "À traiter"], ["done", "Confirmées"], ["cancel", "Annulées"]];
+
+async function load() {
+  const { data, error } = await sb.from("orders").select("*, order_items(*)").order("created_at", { ascending: false }).limit(500);
+  if (error) { toast("Erreur de chargement : " + error.message); return; }
+  orders = data;
+  render();
+  if (selId) loadEvents();
+}
+async function loadEvents() {
+  const { data } = await sb.from("order_events").select("*").eq("order_id", selId).order("at", { ascending: false });
+  events = data || [];
+  renderDetail();
+}
+const cur = () => orders.find(o => o.id === selId);
+
+function renderTabs() {
+  $("#tabs").innerHTML = TABS.map(([k, l]) => {
+    const n = orders.filter(FILTERS[k]).length;
+    return `<button role="tab" data-tab="${k}" aria-selected="${tab === k}">${l}${(k === "queue" || k === "todo") && n ? `<span class="n">${n}</span>` : ""}</button>`;
+  }).join("");
+}
+function render() {
+  renderTabs();
+  $("#queueBar").hidden = tab !== "queue" || !orders.some(FILTERS.queue);
+  let rows = orders.filter(FILTERS[tab]);
+  if (tab === "queue" || tab === "todo") rows = rows.slice().sort((a, b) => {
+    const da = a.status === "reportee" && a.callback_at ? new Date(a.callback_at) : new Date(a.created_at);
+    const db = b.status === "reportee" && b.callback_at ? new Date(b.callback_at) : new Date(b.created_at);
+    return da - db;
+  });
+  $("#list").innerHTML = rows.length ? rows.map(o => {
+    const late = o.status === "reportee" && o.callback_at && new Date(o.callback_at) < new Date();
+    return `<button class="oc ${selId === o.id ? "on" : ""}" data-id="${o.id}">
+      <div class="r1"><b>${esc(o.ref)}</b>${chip(o.status)}</div>
+      <div class="r2">${esc(o.customer_name)} · ${esc(o.wilaya)}</div>
+      <div class="r3"><span>${fmt(o.total)}</span><span>${rel(o.created_at)}</span>
+        ${o.attempts ? `<span>${o.attempts} appel${o.attempts > 1 ? "s" : ""}</span>` : ""}
+        ${o.status === "reportee" && o.callback_at ? `<span class="${late ? "late" : ""}">Rappel ${fdate(o.callback_at)}</span>` : ""}</div>
+    </button>`;
+  }).join("") : `<div class="empty">${{ queue: "Aucune commande en attente.", todo: "Rien à traiter pour le moment.", done: "Aucune commande confirmée.", cancel: "Aucune commande annulée." }[tab]}</div>`;
+  renderDetail();
+}
+
+function localInput(iso) {
+  if (!iso) return "";
+  const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 16);
+}
+function renderDetail() {
+  const box = $("#detail"), o = cur();
+  if (!o) { box.innerHTML = `<div class="empty">Choisissez une commande dans la liste.</div>`; box.classList.remove("open"); return; }
+  box.classList.add("open");
+  const items = o.order_items || [];
+  const canEdit = mine(o) && !["expediee", "livree", "retournee"].includes(o.status);
+  const phone = o.phone;
+  box.innerHTML = `
+    <button class="btn grey sm back" id="backList">← Retour à la liste</button>
+    <div class="head2">
+      <div><h2 style="font-size:22px">${esc(o.ref)}</h2><span class="note">${fdate(o.created_at)} · ${rel(o.created_at)}</span></div>
+      ${chip(o.status)}
+    </div>
+    <div class="fld"><label>Client</label><div style="font-weight:700;font-size:17px">${esc(o.customer_name)}</div></div>
+    <a class="phone" href="tel:${esc(phone)}">☎ ${esc(phone)}</a>
+    <button class="linkbtn" id="copyPhone" style="margin-left:10px">Copier</button>
+    <div class="lines" style="margin-top:14px">
+      ${items.map(i => `<div><span>${esc(i.label)} <span class="note">${esc(i.size || "")}</span> × ${i.qty}</span><span>${fmt(i.unit_price * i.qty)}</span></div>`).join("")}
+      <div><span>Total</span><span>${fmt(o.total)}</span></div>
+    </div>
+    <p class="note" style="margin-bottom:12px">Livraison : ${o.delivery === "Bureau" ? "au bureau de livraison" : "à domicile"}${o.note ? " · Note du client : " + esc(o.note) : ""}</p>
+    ${!o.assigned_to ? `<button class="btn" id="claimBtn" style="width:100%">Prendre cette commande</button>` :
+      !mine(o) ? `<p class="note">Cette commande est attribuée à un autre confirmateur.</p>` : `
+      <div class="row2">
+        <div class="fld"><label for="f_wil">Wilaya</label><select id="f_wil" ${canEdit ? "" : "disabled"}>${wilayaOptions(o.wilaya)}</select></div>
+        <div class="fld"><label for="f_com">Commune</label><input id="f_com" value="${esc(o.commune || "")}" ${canEdit ? "" : "disabled"}></div>
+      </div>
+      <div class="fld"><label for="f_adr">Adresse</label><input id="f_adr" value="${esc(o.address)}" ${canEdit ? "" : "disabled"}></div>
+      <div class="fld"><label for="f_note">Note (obligatoire pour une annulation)</label><textarea id="f_note" ${canEdit ? "" : "disabled"}>${esc(o.confirm_note || "")}</textarea></div>
+      <div class="fld"><label for="f_cb">Date de rappel (pour « Reporter »)</label><input id="f_cb" type="datetime-local" value="${localInput(o.callback_at)}" ${canEdit ? "" : "disabled"}></div>
+      <p class="err" id="detErr" role="alert"></p>
+      ${canEdit ? `<div class="acts">
+        <button class="btn full" data-act="confirmee" style="background:var(--ok);color:#fff">Confirmer la commande</button>
+        <button class="btn grey" data-act="pas_de_reponse">Pas de réponse</button>
+        <button class="btn grey" data-act="reportee">Reporter</button>
+        <button class="btn warn full" data-act="annulee">Annuler la commande</button>
+      </div>` : `<p class="note">Cette commande ne peut plus être modifiée ici.</p>`}`}
+    ${events.length ? `<h3 style="font-size:15px;margin:20px 0 8px">Historique</h3><ul class="hist">${events.map(e => `<li><b>${esc(e.by_name || "")}</b> · ${fdate(e.at)} · ${e.from_status !== e.to_status ? `${(STATUS[e.from_status] || [e.from_status])[0]} → ${(STATUS[e.to_status] || [e.to_status])[0]}` : "Nouvel appel"}${e.note ? `<br>${esc(e.note)}` : ""}</li>`).join("")}</ul>` : ""}`;
+}
+
+async function act(status) {
+  const o = cur(), err = m => { $("#detErr").textContent = m; };
+  const note = $("#f_note").value.trim(), adr = $("#f_adr").value.trim(), com = $("#f_com").value.trim(), cb = $("#f_cb").value;
+  err("");
+  if (status === "annulee" && !note) return err("Indiquez la raison de l'annulation dans la note.");
+  if (status === "reportee" && !cb) return err("Choisissez la date de rappel.");
+  if (status === "confirmee" && (adr.length < 5 || com.length < 2)) return err("Vérifiez l'adresse et la commune avant de confirmer.");
+  $$("[data-act]").forEach(b => b.disabled = true);
+  const { error } = await sb.rpc("update_order", {
+    p_id: o.id, p_status: status, p_note: note || null, p_address: adr, p_commune: com,
+    p_wilaya: $("#f_wil").value, p_callback: status === "reportee" ? new Date(cb).toISOString() : null
+  });
+  if (error) { err(error.message); $$("[data-act]").forEach(b => b.disabled = false); return; }
+  toast({ confirmee: "Commande confirmée", pas_de_reponse: "Appel noté", reportee: "Commande reportée", annulee: "Commande annulée" }[status]);
+  await load();
+}
+
+document.addEventListener("click", async e => {
+  const t = e.target.closest("button"); if (!t) return;
+  if (t.dataset.tab) { tab = t.dataset.tab; render(); }
+  else if (t.classList.contains("oc")) { selId = Number(t.dataset.id); events = []; render(); loadEvents(); }
+  else if (t.dataset.act) act(t.dataset.act);
+  else if (t.id === "backList") { selId = null; render(); }
+  else if (t.id === "refresh") { await load(); toast("Liste actualisée"); }
+  else if (t.id === "logoutBtn") logout();
+  else if (t.id === "copyPhone") { try { await navigator.clipboard.writeText(cur().phone); toast("Numéro copié"); } catch (x) { toast(cur().phone); } }
+  else if (t.id === "claimBtn") {
+    t.disabled = true;
+    const { error } = await sb.rpc("claim_order", { p_id: cur().id });
+    if (error) { toast(error.message); await load(); return; }
+    toast("Commande prise"); tab = "todo"; await load();
+  }
+  else if (t.id === "takeNext") {
+    t.disabled = true;
+    const { data, error } = await sb.rpc("claim_next");
+    t.disabled = false;
+    if (error) return toast(error.message);
+    if (!data) return toast("Plus aucune commande en attente");
+    tab = "todo"; selId = data; await load(); toast("Commande attribuée");
+  }
+});
+
+let tmr;
+function startRealtime() {
+  sb.channel("orders-live").on("postgres_changes", { event: "*", schema: "public", table: "orders" }, p => {
+    if (p.eventType === "INSERT") toast("Nouvelle commande reçue");
+    clearTimeout(tmr); tmr = setTimeout(load, 400);
+  }).subscribe();
+}
+
+boot(["confirmateur", "admin"], async prof => {
+  me = prof;
+  $("#brandLogo").innerHTML = logoInner("Confirmateur");
+  $("#who").textContent = prof.name || prof.email;
+  await load();
+  startRealtime();
+});
+</script>
+</body>
+</html>

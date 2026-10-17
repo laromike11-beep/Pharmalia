@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Administration</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Manrope:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="panel.css">
+<style>
+.pill{display:inline-flex;gap:6px;align-items:center}
+.switch{position:relative;width:40px;height:22px;border-radius:99px;border:0;background:var(--line);cursor:pointer;padding:0;flex:none}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.15s}
+.switch[aria-checked="true"]{background:var(--brand)}
+.switch[aria-checked="true"]::after{left:21px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.tile{display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px}
+.tile .thumb{width:56px;height:56px}
+.tile b{display:block}
+.tile .act{margin-left:auto;display:flex;gap:6px;align-items:center}
+.off{opacity:.55}
+.warnbox{background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 40%,transparent);border-radius:12px;padding:12px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.warnbox span{flex:1;min-width:200px}
+.preview{width:90px;height:90px;border:1.5px dashed var(--line);border-radius:12px;display:grid;place-items:center;overflow:hidden;background:var(--bg);color:var(--muted);font-size:12px;text-align:center}
+.preview img{width:100%;height:100%;object-fit:contain}
+.up{display:flex;gap:14px;align-items:center;margin-bottom:12px}
+textarea.code{font-family:ui-monospace,Menlo,monospace;font-size:13px;min-height:160px}
+</style>
+</head>
+<body>
+<div id="auth" hidden></div>
+<div id="app" hidden>
+  <header class="top">
+    <div class="in">
+      <div class="logo" id="brandLogo"></div>
+      <div class="grow"></div>
+      <span class="who" id="who"></span>
+      <button class="btn grey sm" id="refresh">Actualiser</button>
+      <button class="btn grey sm" id="logoutBtn">Déconnexion</button>
+    </div>
+    <div class="tabs" id="tabs" role="tablist"></div>
+  </header>
+  <main class="page" id="view"></main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+let me = null, tab = "dash", period = "7";
+let orders = [], profiles = [], brands = [], cats = [], products = [];
+const F = { ostatus: "", oconf: "", oq: "", pq: "", pbrand: "", pcat: "", pactive: "" };
+const CONFIRMED = ["confirmee", "expediee", "livree", "retournee"];
+const OPEN = ["nouvelle", "pas_de_reponse", "reportee"];
+const TABS = [["dash", "Tableau de bord"], ["orders", "Commandes"], ["products", "Produits"], ["brands", "Marques"], ["cats", "Catégories"], ["team", "Équipe"]];
+
+async function fetchAll(make) {
+  let all = [], from = 0;
+  for (;;) {
+    const { data, error } = await make(from, from + 999);
+    if (error) throw error;
+    all = all.concat(data);
+    if (data.length < 1000) break;
+    from += 1000;
+  }
+  return all;
+}
+async function loadAll() {
+  try {
+    [orders, profiles, brands, cats, products] = await Promise.all([
+      fetchAll((a, b) => sb.from("orders").select("*, order_items(*)").order("created_at", { ascending: false }).range(a, b)),
+      fetchAll((a, b) => sb.from("profiles").select("*").order("created_at").range(a, b)),
+      fetchAll((a, b) => sb.from("brands").select("*").order("name").range(a, b)),
+      fetchAll((a, b) => sb.from("categories").select("*").order("sort").order("name").range(a, b)),
+      fetchAll((a, b) => sb.from("products").select("*").order("name").range(a, b))
+    ]);
+  } catch (e) { toast("Erreur de chargement : " + e.message); }
+  render();
+}
+const brandName = id => (brands.find(b => b.id === id) || {}).name || "—";
+const catName = id => (cats.find(c => c.id === id) || {}).name || "—";
+const staffName = id => (profiles.find(p => p.id === id) || {}).name || (id ? "?" : "Non attribuée");
+const confirmateurs = () => profiles.filter(p => p.role === "confirmateur");
+const monogram = n => esc((n || "?").trim().slice(0, 2).toUpperCase());
+
+function render() {
+  $("#tabs").innerHTML = TABS.map(([k, l]) => {
+    const n = k === "orders" ? orders.filter(o => !o.assigned_to && o.status === "nouvelle").length : 0;
+    return `<button role="tab" data-tab="${k}" aria-selected="${tab === k}">${l}${n ? `<span class="n">${n}</span>` : ""}</button>`;
+  }).join("");
+  ({ dash: viewDash, orders: viewOrders, products: viewProducts, brands: viewBrands, cats: viewCats, team: viewTeam })[tab]();
+}
+
+/* ---------- Tableau de bord ---------- */
+function inPeriod(o) {
+  if (period === "all") return true;
+  const d = new Date(o.created_at), now = new Date();
+  if (period === "0") return d.toDateString() === now.toDateString();
+  return now - d <= Number(period) * 86400000;
+}
+function bars(rows, color) {
+  const max = Math.max(1, ...rows.map(r => r[1]));
+  return rows.map(([l, n, c]) => `<div class="hbar"><span>${esc(l)}</span><i><s style="width:${n / max * 100}%;${c ? `--c:var(--c-${c})` : ""}"></s></i><b>${n}</b></div>`).join("");
+}
+function viewDash() {
+  const os = orders.filter(inPeriod), n = os.length;
+  const conf = os.filter(o => CONFIRMED.includes(o.status)).length;
+  const livrees = os.filter(o => o.status === "livree"), ret = os.filter(o => o.status === "retournee").length;
+  const caLivre = livrees.reduce((s, o) => s + o.total, 0);
+  const caEnCours = os.filter(o => ["confirmee", "expediee"].includes(o.status)).reduce((s, o) => s + o.total, 0);
+  const unassigned = orders.filter(o => !o.assigned_to && o.status === "nouvelle");
+  const byStatus = Object.keys(STATUS).map(k => [STATUS[k][0], os.filter(o => o.status === k).length, STATUS[k][1] === "grey" ? "" : ({ blue: "blue", green: "green", amber: "amber", violet: "violet", red: "red", teal: "teal" })[STATUS[k][1]]]);
+  const wil = {}; os.forEach(o => wil[o.wilaya] = (wil[o.wilaya] || 0) + 1);
+  const topW = Object.entries(wil).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const top = {}; os.forEach(o => (o.order_items || []).forEach(i => top[i.label] = (top[i.label] || 0) + i.qty));
+  const topP = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  $("#view").innerHTML = `
+    <div class="bar">
+      <select id="period" class="inp" aria-label="Période">
+        ${[["0", "Aujourd'hui"], ["7", "7 derniers jours"], ["30", "30 derniers jours"], ["all", "Tout"]].map(([v, l]) => `<option value="${v}" ${v === period ? "selected" : ""}>${l}</option>`).join("")}
+      </select>
+    </div>
+    ${unassigned.length ? `<div class="warnbox"><span><b>${unassigned.length} commande${unassigned.length > 1 ? "s" : ""}</b> en attente d'attribution.</span>
+      <button class="btn sm" id="autoAssign" ${confirmateurs().length ? "" : "disabled"}>Répartir entre les confirmateurs</button></div>` : ""}
+    <div class="kpis">
+      <div class="kpi"><span>Commandes</span><b>${n}</b></div>
+      <div class="kpi"><span>Taux de confirmation</span><b>${n ? Math.round(conf / n * 100) : 0} %</b><small>${conf} confirmées</small></div>
+      <div class="kpi"><span>Chiffre d'affaires livré</span><b>${fmt(caLivre)}</b><small>${livrees.length} livraisons</small></div>
+      <div class="kpi"><span>Confirmé, en cours</span><b>${fmt(caEnCours)}</b></div>
+      <div class="kpi"><span>Taux de retour</span><b>${livrees.length + ret ? Math.round(ret / (livrees.length + ret) * 100) : 0} %</b><small>${ret} retours</small></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h2>Commandes par statut</h2>${bars(byStatus)}</div>
+      <div class="card"><h2>Performance des confirmateurs</h2>
+        ${confirmateurs().length ? `<div class="tablewrap" style="border:0"><table><thead><tr><th>Nom</th><th class="num">Reçues</th><th class="num">Confirmées</th><th class="num">Annulées</th><th class="num">Taux</th></tr></thead><tbody>
+          ${confirmateurs().map(p => { const mo = os.filter(o => o.assigned_to === p.id), c = mo.filter(o => CONFIRMED.includes(o.status)).length, a = mo.filter(o => o.status === "annulee").length; return `<tr><td>${esc(p.name || p.email)}</td><td class="num">${mo.length}</td><td class="num">${c}</td><td class="num">${a}</td><td class="num">${mo.length ? Math.round(c / mo.length * 100) : 0} %</td></tr>`; }).join("")}
+        </tbody></table></div>` : `<p class="note">Aucun confirmateur. Ajoutez-en dans l'onglet Équipe.</p>`}
+      </div>
+      <div class="card"><h2>Wilayas les plus actives</h2>${topW.length ? bars(topW) : `<p class="note">Pas encore de données.</p>`}</div>
+      <div class="card"><h2>Produits les plus commandés</h2>${topP.length ? bars(topP) : `<p class="note">Pas encore de données.</p>`}</div>
+    </div>`;
+}
+async function autoAssign() {
+  const un = orders.filter(o => !o.assigned_to && o.status === "nouvelle").slice().reverse();
+  const cs = confirmateurs(); if (!un.length || !cs.length) return;
+  const load = Object.fromEntries(cs.map(c => [c.id, orders.filter(o => o.assigned_to === c.id && OPEN.includes(o.status)).length]));
+  const plan = Object.fromEntries(cs.map(c => [c.id, []]));
+  un.forEach(o => { const id = cs.map(c => c.id).sort((a, b) => load[a] - load[b])[0]; plan[id].push(o.id); load[id]++; });
+  for (const [id, ids] of Object.entries(plan)) {
+    if (!ids.length) continue;
+    const { error } = await sb.from("orders").update({ assigned_to: id }).in("id", ids);
+    if (error) { toast(error.message); return; }
+  }
+  toast("Commandes réparties"); await loadAll();
+}
+
+/* ---------- Commandes ---------- */
+function viewOrders() {
+  const q = F.oq.toLowerCase();
+  let rows = orders.filter(o =>
+    (!F.ostatus || o.status === F.ostatus) &&
+    (!F.oconf || (F.oconf === "none" ? !o.assigned_to : o.assigned_to === F.oconf)) &&
+    (!q || (o.ref + " " + o.customer_name + " " + o.phone + " " + o.wilaya).toLowerCase().includes(q)));
+  $("#view").innerHTML = `
+    <div class="bar">
+      <input class="inp search" id="oq" placeholder="Rechercher : référence, nom, téléphone, wilaya" value="${esc(F.oq)}" aria-label="Rechercher">
+      <select class="inp" id="ostatus" aria-label="Statut"><option value="">Tous les statuts</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${F.ostatus === k ? "selected" : ""}>${v[0]}</option>`).join("")}</select>
+      <select class="inp" id="oconf" aria-label="Confirmateur"><option value="">Tous les confirmateurs</option><option value="none" ${F.oconf === "none" ? "selected" : ""}>Non attribuées</option>${confirmateurs().map(p => `<option value="${p.id}" ${F.oconf === p.id ? "selected" : ""}>${esc(p.name || p.email)}</option>`).join("")}</select>
+      <button class="btn ghost sm" id="exportCsv">Exporter CSV</button>
+    </div>
+    <div class="tablewrap"><table><thead><tr><th>Réf.</th><th>Date</th><th>Client</th><th>Wilaya</th><th class="num">Total</th><th>Statut</th><th>Confirmateur</th></tr></thead><tbody>
+    ${rows.slice(0, 300).map(o => `<tr class="click" data-order="${o.id}"><td><b>${esc(o.ref)}</b></td><td>${fdate(o.created_at)}</td><td>${esc(o.customer_name)}<br><span class="note">${esc(o.phone)}</span></td><td>${esc(o.wilaya)}</td><td class="num">${fmt(o.total)}</td><td>${chip(o.status)}</td><td>${esc(staffName(o.assigned_to))}</td></tr>`).join("") || `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">Aucune commande.</td></tr>`}
+    </tbody></table></div>
+    ${rows.length > 300 ? `<p class="note" style="margin-top:8px">${rows.length} commandes. Les 300 plus récentes sont affichées, utilisez les filtres ou l'export CSV.</p>` : ""}`;
+}
+function exportCsv() {
+  const q = F.oq.toLowerCase();
+  const rows = orders.filter(o => (!F.ostatus || o.status === F.ostatus) && (!F.oconf || (F.oconf === "none" ? !o.assigned_to : o.assigned_to === F.oconf)) && (!q || (o.ref + " " + o.customer_name + " " + o.phone + " " + o.wilaya).toLowerCase().includes(q)));
+  const head = ["Référence", "Date", "Client", "Téléphone", "Wilaya", "Commune", "Adresse", "Livraison", "Produits", "Total", "Statut", "Confirmateur"];
+  const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = rows.map(o => [o.ref, o.created_at, o.customer_name, o.phone, o.wilaya, o.commune, o.address, o.delivery, (o.order_items || []).map(i => `${i.label} x${i.qty}`).join(" | "), o.total, STATUS[o.status][0], staffName(o.assigned_to)].map(cell).join(";"));
+  const blob = new Blob(["﻿" + [head.map(cell).join(";"), ...lines].join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "commandes.csv"; a.click(); URL.revokeObjectURL(a.href);
+}
+
+/* ---------- Modale ---------- */
+function openModal(title, body) {
+  closeModal();
+  const m = document.createElement("div"); m.className = "scrim"; m.id = "modalWrap";
+  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}"><div class="mh"><h2 style="font-size:19px">${esc(title)}</h2><button class="x" data-close aria-label="Fermer">×</button></div><div class="mb">${body}</div></div>`;
+  m.addEventListener("mousedown", e => { if (e.target === m) closeModal(); });
+  document.body.appendChild(m);
+  return m;
+}
+function closeModal() { const m = $("#modalWrap"); if (m) m.remove(); }
+
+async function orderModal(id) {
+  const o = orders.find(x => x.id === id); if (!o) return;
+  const m = openModal("Commande " + o.ref, `
+    <div class="head2" style="display:flex;justify-content:space-between;gap:10px;margin-bottom:12px">${chip(o.status)}<span class="note">${fdate(o.created_at)}</span></div>
+    <p style="margin:0 0 4px;font-weight:700;font-size:17px">${esc(o.customer_name)}</p>
+    <p style="margin:0 0 12px"><a href="tel:${esc(o.phone)}" style="color:var(--brand);font-weight:700">${esc(o.phone)}</a> · ${o.delivery === "Bureau" ? "livraison au bureau" : "livraison à domicile"}${o.note ? "<br>Note client : " + esc(o.note) : ""}</p>
+    <div class="lines">${(o.order_items || []).map(i => `<div><span>${esc(i.label)} <span class="note">${esc(i.size || "")}</span> × ${i.qty}</span><span>${fmt(i.unit_price * i.qty)}</span></div>`).join("")}<div><span>Total</span><span>${fmt(o.total)}</span></div></div>
+    <div class="row2">
+      <div class="fld"><label for="m_status">Statut</label><select id="m_status">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${o.status === k ? "selected" : ""}>${v[0]}</option>`).join("")}</select></div>
+      <div class="fld"><label for="m_conf">Confirmateur</label><select id="m_conf"><option value="">Non attribuée</option>${profiles.filter(p => ["confirmateur", "admin"].includes(p.role)).map(p => `<option value="${p.id}" ${o.assigned_to === p.id ? "selected" : ""}>${esc(p.name || p.email)}</option>`).join("")}</select></div>
+    </div>
+    <div class="row2">
+      <div class="fld"><label for="m_wil">Wilaya</label><select id="m_wil">${wilayaOptions(o.wilaya)}</select></div>
+      <div class="fld"><label for="m_com">Commune</label><input id="m_com" value="${esc(o.commune || "")}"></div>
+    </div>
+    <div class="fld"><label for="m_adr">Adresse</label><input id="m_adr" value="${esc(o.address)}"></div>
+    <div class="fld"><label for="m_note">Note interne</label><textarea id="m_note">${esc(o.confirm_note || "")}</textarea></div>
+    <p class="err" id="m_err" role="alert"></p>
+    <button class="btn" id="m_save">Enregistrer</button>
+    <div id="m_hist"></div>`);
+  $("#m_save", m).onclick = async () => {
+    $("#m_save", m).disabled = true;
+    const conf = $("#m_conf", m).value || null;
+    if (conf !== o.assigned_to) {
+      const { error } = await sb.from("orders").update({ assigned_to: conf }).eq("id", o.id);
+      if (error) { $("#m_err", m).textContent = error.message; $("#m_save", m).disabled = false; return; }
+    }
+    const { error } = await sb.rpc("update_order", { p_id: o.id, p_status: $("#m_status", m).value, p_note: $("#m_note", m).value, p_address: $("#m_adr", m).value, p_commune: $("#m_com", m).value, p_wilaya: $("#m_wil", m).value, p_callback: null });
+    if (error) { $("#m_err", m).textContent = error.message; $("#m_save", m).disabled = false; return; }
+    toast("Commande mise à jour"); closeModal(); loadAll();
+  };
+  const { data } = await sb.from("order_events").select("*").eq("order_id", o.id).order("at", { ascending: false });
+  if (data && data.length && $("#m_hist", m)) $("#m_hist", m).innerHTML = `<h3 style="font-size:15px;margin:20px 0 8px">Historique</h3><ul class="hist">${data.map(e => `<li><b>${esc(e.by_name || "")}</b> · ${fdate(e.at)} · ${e.from_status !== e.to_status ? `${(STATUS[e.from_status] || [e.from_status])[0]} → ${(STATUS[e.to_status] || [e.to_status])[0]}` : "Nouvel appel"}${e.note ? `<br>${esc(e.note)}` : ""}</li>`).join("")}</ul>`;
+}
+
+/* ---------- Images ---------- */
+async function uploadImage(bucket, file, base) {
+  if (file.size > 1.5 * 1024 * 1024) throw new Error("Image trop lourde (maximum 1,5 Mo).");
+  const ext = (file.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!["png", "jpg", "jpeg", "webp", "svg", "gif"].includes(ext)) throw new Error("Format non pris en charge (PNG, JPG, WEBP ou SVG).");
+  const path = `${base}-${Date.now()}.${ext}`;
+  const { error } = await sb.storage.from(bucket).upload(path, file, { contentType: file.type || undefined, cacheControl: "31536000" });
+  if (error) throw error;
+  return sb.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+}
+function wirePreview(m, inputSel, prevSel) {
+  $(inputSel, m).addEventListener("change", e => {
+    const f = e.target.files[0]; if (!f) return;
+    $(prevSel, m).innerHTML = `<img alt="" src="${URL.createObjectURL(f)}">`;
+  });
+}
+
+/* ---------- Produits ---------- */
+function viewProducts() {
+  const q = F.pq.toLowerCase();
+  const rows = products.filter(p =>
+    (!F.pbrand || String(p.brand_id) === F.pbrand) && (!F.pcat || String(p.category_id) === F.pcat) &&
+    (!F.pactive || String(p.active) === F.pactive) && (!q || (p.name + " " + brandName(p.brand_id)).toLowerCase().includes(q)));
+  $("#view").innerHTML = `
+    <div class="bar">
+      <input class="inp search" id="pq" placeholder="Rechercher un produit" value="${esc(F.pq)}" aria-label="Rechercher">
+      <select class="inp" id="pbrand" aria-label="Marque"><option value="">Toutes les marques</option>${brands.map(b => `<option value="${b.id}" ${F.pbrand === String(b.id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}</select>
+      <select class="inp" id="pcat" aria-label="Catégorie"><option value="">Toutes les catégories</option>${cats.map(c => `<option value="${c.id}" ${F.pcat === String(c.id) ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select>
+      <select class="inp" id="pactive" aria-label="Visibilité"><option value="">Tous</option><option value="true" ${F.pactive === "true" ? "selected" : ""}>Visibles</option><option value="false" ${F.pactive === "false" ? "selected" : ""}>Masqués</option></select>
+      <button class="btn ghost sm" id="importCsv">Importer</button>
+      <button class="btn sm" id="addProduct">Ajouter un produit</button>
+    </div>
+    <div class="tablewrap"><table><thead><tr><th></th><th>Produit</th><th>Marque</th><th>Catégorie</th><th class="num">Prix</th><th class="num">Qté min.</th><th>Visible</th></tr></thead><tbody>
+    ${rows.slice(0, 300).map(p => `<tr class="click ${p.active ? "" : "off"}" data-product="${p.id}">
+      <td><div class="thumb">${p.image_url ? `<img alt="" loading="lazy" src="${esc(p.image_url)}">` : monogram(p.name)}</div></td>
+      <td><b>${esc(p.name)}</b>${p.is_new ? ` <span class="st blue">Nouveau</span>` : ""}<br><span class="note">${esc(p.size || "")}</span></td>
+      <td>${esc(brandName(p.brand_id))}</td><td>${esc(catName(p.category_id))}</td>
+      <td class="num">${fmt(p.price)}</td><td class="num">${p.min_qty}</td><td>${p.active ? "Oui" : "Non"}</td></tr>`).join("") || `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">Aucun produit.</td></tr>`}
+    </tbody></table></div>
+    <p class="note" style="margin-top:8px">${rows.length} produit${rows.length > 1 ? "s" : ""}${rows.length > 300 ? " (300 affichés, utilisez les filtres)" : ""}.</p>`;
+}
+function productModal(id) {
+  const p = products.find(x => x.id === id) || { name: "", size: "", price: "", min_qty: 3, stock: "", is_new: false, active: true, image_url: "", brand_id: "", category_id: "" };
+  if (!brands.length || !cats.length) { toast("Créez d'abord au moins une marque et une catégorie."); return; }
+  const m = openModal(id ? "Modifier le produit" : "Nouveau produit", `
+    <div class="up"><div class="preview" id="pv">${p.image_url ? `<img alt="" src="${esc(p.image_url)}">` : "Photo"}</div>
+      <div class="fld" style="margin:0;flex:1"><label for="p_img">Photo du produit (facultatif)</label><input id="p_img" type="file" accept="image/*"></div></div>
+    <div class="fld"><label for="p_name">Nom du produit *</label><input id="p_name" value="${esc(p.name)}"></div>
+    <div class="row2">
+      <div class="fld"><label for="p_brand">Marque *</label><select id="p_brand"><option value="">Choisir…</option>${brands.map(b => `<option value="${b.id}" ${p.brand_id === b.id ? "selected" : ""}>${esc(b.name)}</option>`).join("")}</select></div>
+      <div class="fld"><label for="p_cat">Catégorie *</label><select id="p_cat"><option value="">Choisir…</option>${cats.map(c => `<option value="${c.id}" ${p.category_id === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select></div>
+    </div>
+    <div class="row3">
+      <div class="fld"><label for="p_size">Contenance</label><input id="p_size" value="${esc(p.size || "")}" placeholder="30 ml"></div>
+      <div class="fld"><label for="p_price">Prix (DA) *</label><input id="p_price" type="number" min="0" value="${p.price}"></div>
+      <div class="fld"><label for="p_min">Quantité min.</label><input id="p_min" type="number" min="1" value="${p.min_qty}"></div>
+    </div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px">
+      <label class="pill"><input type="checkbox" id="p_new" ${p.is_new ? "checked" : ""}> Nouveauté</label>
+      <label class="pill"><input type="checkbox" id="p_active" ${p.active ? "checked" : ""}> Visible sur le site</label>
+    </div>
+    <p class="err" id="p_err" role="alert"></p>
+    <button class="btn" id="p_save">Enregistrer</button>`);
+  wirePreview(m, "#p_img", "#pv");
+  $("#p_save", m).onclick = async () => {
+    const name = $("#p_name", m).value.trim(), brand = $("#p_brand", m).value, cat = $("#p_cat", m).value, price = parseInt($("#p_price", m).value, 10);
+    const err = t => { $("#p_err", m).textContent = t; };
+    if (name.length < 2) return err("Indiquez le nom du produit.");
+    if (!brand) return err("Choisissez une marque.");
+    if (!cat) return err("Choisissez une catégorie.");
+    if (!(price >= 0)) return err("Indiquez un prix valide.");
+    $("#p_save", m).disabled = true; err("");
+    try {
+      let image_url = p.image_url || null;
+      const f = $("#p_img", m).files[0];
+      if (f) image_url = await uploadImage("produits", f, "p-" + (slugify(name) || "produit"));
+      const row = { name, brand_id: Number(brand), category_id: Number(cat), size: $("#p_size", m).value.trim() || null, price, min_qty: Math.max(1, parseInt($("#p_min", m).value, 10) || 1), is_new: $("#p_new", m).checked, active: $("#p_active", m).checked, image_url };
+      const { error } = id ? await sb.from("products").update(row).eq("id", id) : await sb.from("products").insert(row);
+      if (error) throw error;
+      toast("Produit enregistré"); closeModal(); loadAll();
+    } catch (e) { err(e.message); $("#p_save", m).disabled = false; }
+  };
+}
+function importModal() {
+  const m = openModal("Importer des produits", `
+    <p class="note" style="margin-bottom:10px">Collez une ligne par produit, colonnes séparées par un point-virgule ou une tabulation (copier-coller depuis Excel) :<br><b>Marque ; Catégorie ; Nom ; Contenance ; Prix ; Quantité min.</b><br>Les marques et catégories qui n'existent pas encore sont créées (vous pourrez ajouter leur logo ensuite).</p>
+    <div class="fld"><textarea class="code" id="i_txt" placeholder="Verdane;Soins du visage;Sérum Éclat;30 ml;3400;3"></textarea></div>
+    <p class="err" id="i_err" role="alert"></p>
+    <button class="btn" id="i_go">Importer</button>`);
+  $("#i_go", m).onclick = async () => {
+    const err = t => { $("#i_err", m).textContent = t; };
+    let rows = $("#i_txt", m).value.split(/\r?\n/).map(l => l.split(/[;\t]/).map(s => s.trim())).filter(r => r.length >= 5 && r[0]);
+    if (rows.length && isNaN(Number(r4(rows[0])))) rows = rows.slice(1);
+    if (!rows.length) return err("Aucune ligne valide. Vérifiez le format.");
+    const bad = rows.findIndex(r => !r[0] || !r[1] || !r[2] || isNaN(parseInt(r[4], 10)));
+    if (bad >= 0) return err(`Ligne ${bad + 1} incomplète : marque, catégorie, nom et prix sont obligatoires.`);
+    $("#i_go", m).disabled = true; err("");
+    try {
+      const key = s => s.toLowerCase();
+      const ensure = async (table, names, list) => {
+        const have = new Set(list.map(x => key(x.name)));
+        const miss = [...new Map(names.filter(n => !have.has(key(n))).map(n => [key(n), n])).values()];
+        if (miss.length) { const { error } = await sb.from(table).insert(miss.map(n => ({ name: n, slug: slugify(n) }))); if (error) throw error; }
+        const { data, error } = await sb.from(table).select("*"); if (error) throw error; return data;
+      };
+      const B = await ensure("brands", rows.map(r => r[0]), brands), C = await ensure("categories", rows.map(r => r[1]), cats);
+      const bid = Object.fromEntries(B.map(b => [key(b.name), b.id])), cid = Object.fromEntries(C.map(c => [key(c.name), c.id]));
+      const payload = rows.map(r => ({ brand_id: bid[key(r[0])], category_id: cid[key(r[1])], name: r[2], size: r[3] || null, price: parseInt(r[4], 10), min_qty: Math.max(1, parseInt(r[5], 10) || 3) }));
+      for (let i = 0; i < payload.length; i += 200) { const { error } = await sb.from("products").insert(payload.slice(i, i + 200)); if (error) throw error; }
+      toast(payload.length + " produits importés"); closeModal(); loadAll();
+    } catch (e) { err(e.message); $("#i_go", m).disabled = false; }
+  };
+}
+const r4 = r => r[4];
+
+/* ---------- Marques ---------- */
+function viewBrands() {
+  $("#view").innerHTML = `
+    <div class="bar"><span class="note" style="flex:1">Chaque produit appartient à une marque. Le logo s'affiche sur la page « Nos marques » de la boutique.</span><button class="btn sm" id="addBrand">Ajouter une marque</button></div>
+    <div class="tiles">${brands.map(b => `<div class="tile ${b.active ? "" : "off"}"><div class="thumb">${b.logo_url ? `<img alt="" src="${esc(b.logo_url)}">` : monogram(b.name)}</div>
+      <div><b>${esc(b.name)}</b><span class="note">${products.filter(p => p.brand_id === b.id).length} produits</span></div>
+      <div class="act"><button class="btn grey sm" data-brand="${b.id}">Modifier</button></div></div>`).join("") || `<p class="note">Aucune marque pour le moment.</p>`}</div>`;
+}
+function brandModal(id) {
+  const b = brands.find(x => x.id === id) || { name: "", logo_url: "", active: true };
+  const m = openModal(id ? "Modifier la marque" : "Nouvelle marque", `
+    <div class="up"><div class="preview" id="pv">${b.logo_url ? `<img alt="" src="${esc(b.logo_url)}">` : "Logo"}</div>
+      <div class="fld" style="margin:0;flex:1"><label for="b_logo">Logo de la marque (PNG, JPG, WEBP ou SVG, 1,5 Mo max)</label><input id="b_logo" type="file" accept="image/*"></div></div>
+    <div class="fld"><label for="b_name">Nom de la marque *</label><input id="b_name" value="${esc(b.name)}"></div>
+    <label class="pill" style="margin-bottom:12px"><input type="checkbox" id="b_active" ${b.active ? "checked" : ""}> Visible sur le site</label>
+    <p class="err" id="b_err" role="alert"></p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn" id="b_save">Enregistrer</button>${id ? `<button class="btn grey" id="b_del">Supprimer</button>` : ""}</div>`);
+  wirePreview(m, "#b_logo", "#pv");
+  const err = t => { $("#b_err", m).textContent = t; };
+  $("#b_save", m).onclick = async () => {
+    const name = $("#b_name", m).value.trim(); if (name.length < 2) return err("Indiquez le nom de la marque.");
+    $("#b_save", m).disabled = true; err("");
+    try {
+      let logo_url = b.logo_url || null; const f = $("#b_logo", m).files[0];
+      if (f) logo_url = await uploadImage("logos", f, slugify(name) || "marque");
+      const row = { name, slug: slugify(name), logo_url, active: $("#b_active", m).checked };
+      const { error } = id ? await sb.from("brands").update(row).eq("id", id) : await sb.from("brands").insert(row);
+      if (error) throw error;
+      toast("Marque enregistrée"); closeModal(); loadAll();
+    } catch (e) { err(/duplicate/.test(e.message) ? "Cette marque existe déjà." : e.message); $("#b_save", m).disabled = false; }
+  };
+  if (id) $("#b_del", m).onclick = async () => {
+    if (products.some(p => p.brand_id === id)) return err("Cette marque a des produits. Masquez-la plutôt que de la supprimer.");
+    const { error } = await sb.from("brands").delete().eq("id", id);
+    if (error) return err(error.message);
+    toast("Marque supprimée"); closeModal(); loadAll();
+  };
+}
+
+/* ---------- Catégories ---------- */
+function viewCats() {
+  $("#view").innerHTML = `
+    <div class="bar"><span class="note" style="flex:1">Chaque produit appartient à une catégorie. L'ordre définit l'affichage sur la boutique.</span><button class="btn sm" id="addCat">Ajouter une catégorie</button></div>
+    <div class="tablewrap"><table><thead><tr><th>Ordre</th><th>Catégorie</th><th class="num">Produits</th><th>Visible</th><th></th></tr></thead><tbody>
+    ${cats.map(c => `<tr class="${c.active ? "" : "off"}"><td>${c.sort}</td><td><b>${esc(c.name)}</b></td><td class="num">${products.filter(p => p.category_id === c.id).length}</td><td>${c.active ? "Oui" : "Non"}</td><td class="num"><button class="btn grey sm" data-cat="${c.id}">Modifier</button></td></tr>`).join("") || `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:30px">Aucune catégorie.</td></tr>`}
+    </tbody></table></div>`;
+}
+function catModal(id) {
+  const c = cats.find(x => x.id === id) || { name: "", sort: cats.length + 1, active: true };
+  const m = openModal(id ? "Modifier la catégorie" : "Nouvelle catégorie", `
+    <div class="row2"><div class="fld"><label for="c_name">Nom *</label><input id="c_name" value="${esc(c.name)}"></div>
+    <div class="fld"><label for="c_sort">Ordre d'affichage</label><input id="c_sort" type="number" value="${c.sort}"></div></div>
+    <label class="pill" style="margin-bottom:12px"><input type="checkbox" id="c_active" ${c.active ? "checked" : ""}> Visible sur le site</label>
+    <p class="err" id="c_err" role="alert"></p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn" id="c_save">Enregistrer</button>${id ? `<button class="btn grey" id="c_del">Supprimer</button>` : ""}</div>`);
+  const err = t => { $("#c_err", m).textContent = t; };
+  $("#c_save", m).onclick = async () => {
+    const name = $("#c_name", m).value.trim(); if (name.length < 2) return err("Indiquez le nom de la catégorie.");
+    $("#c_save", m).disabled = true;
+    const row = { name, slug: slugify(name), sort: parseInt($("#c_sort", m).value, 10) || 0, active: $("#c_active", m).checked };
+    const { error } = id ? await sb.from("categories").update(row).eq("id", id) : await sb.from("categories").insert(row);
+    if (error) { err(/duplicate/.test(error.message) ? "Cette catégorie existe déjà." : error.message); $("#c_save", m).disabled = false; return; }
+    toast("Catégorie enregistrée"); closeModal(); loadAll();
+  };
+  if (id) $("#c_del", m).onclick = async () => {
+    if (products.some(p => p.category_id === id)) return err("Cette catégorie a des produits. Masquez-la plutôt que de la supprimer.");
+    const { error } = await sb.from("categories").delete().eq("id", id);
+    if (error) return err(error.message);
+    toast("Catégorie supprimée"); closeModal(); loadAll();
+  };
+}
+
+/* ---------- Équipe ---------- */
+function viewTeam() {
+  $("#view").innerHTML = `
+    <div class="card" style="margin-bottom:16px"><h2>Ajouter un confirmateur</h2>
+      <p class="note">1. Dans Supabase : Authentication → Users → Add user (email et mot de passe).<br>2. Le compte apparaît ci-dessous sans rôle : choisissez « Confirmateur ».</p></div>
+    <div class="tablewrap"><table><thead><tr><th>Nom</th><th>Email</th><th>Rôle</th></tr></thead><tbody>
+    ${profiles.map(p => `<tr><td><input class="inp" data-pname="${p.id}" value="${esc(p.name || "")}" aria-label="Nom" style="min-width:160px"></td><td>${esc(p.email || "")}</td>
+      <td><select class="inp" data-prole="${p.id}" ${p.id === me.id ? "disabled" : ""} aria-label="Rôle">${[["none", "Aucun accès"], ["confirmateur", "Confirmateur"], ["admin", "Administrateur"]].map(([v, l]) => `<option value="${v}" ${p.role === v ? "selected" : ""}>${l}</option>`).join("")}</select></td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+/* ---------- Événements ---------- */
+document.addEventListener("click", e => {
+  const t = e.target.closest("button, tr[data-order], tr[data-product]"); if (!t) return;
+  if (t.dataset.tab) { tab = t.dataset.tab; render(); }
+  else if (t.dataset.order) orderModal(Number(t.dataset.order));
+  else if (t.dataset.product) productModal(Number(t.dataset.product));
+  else if (t.dataset.brand) brandModal(Number(t.dataset.brand));
+  else if (t.dataset.cat) catModal(Number(t.dataset.cat));
+  else if (t.hasAttribute("data-close")) closeModal();
+  else if (t.id === "addProduct") productModal(null);
+  else if (t.id === "addBrand") brandModal(null);
+  else if (t.id === "addCat") catModal(null);
+  else if (t.id === "importCsv") importModal();
+  else if (t.id === "exportCsv") exportCsv();
+  else if (t.id === "autoAssign") autoAssign();
+  else if (t.id === "refresh") loadAll().then(() => toast("Données actualisées"));
+  else if (t.id === "logoutBtn") logout();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+document.addEventListener("input", e => {
+  const id = e.target.id;
+  if (id === "oq") { F.oq = e.target.value; const pos = e.target.selectionStart; viewOrders(); const n = $("#oq"); n.focus(); n.setSelectionRange(pos, pos); }
+  else if (id === "pq") { F.pq = e.target.value; const pos = e.target.selectionStart; viewProducts(); const n = $("#pq"); n.focus(); n.setSelectionRange(pos, pos); }
+});
+document.addEventListener("change", async e => {
+  const t = e.target, id = t.id;
+  if (id === "period") { period = t.value; viewDash(); }
+  else if (id === "ostatus") { F.ostatus = t.value; viewOrders(); }
+  else if (id === "oconf") { F.oconf = t.value; viewOrders(); }
+  else if (id === "pbrand") { F.pbrand = t.value; viewProducts(); }
+  else if (id === "pcat") { F.pcat = t.value; viewProducts(); }
+  else if (id === "pactive") { F.pactive = t.value; viewProducts(); }
+  else if (t.dataset.prole) {
+    const { error } = await sb.from("profiles").update({ role: t.value }).eq("id", t.dataset.prole);
+    toast(error ? error.message : "Rôle mis à jour"); if (!error) { profiles.find(p => p.id === t.dataset.prole).role = t.value; }
+  }
+  else if (t.dataset.pname) {
+    const { error } = await sb.from("profiles").update({ name: t.value.trim() }).eq("id", t.dataset.pname);
+    toast(error ? error.message : "Nom enregistré");
+  }
+});
+
+let tmr;
+boot(["admin"], async prof => {
+  me = prof;
+  $("#brandLogo").innerHTML = logoInner("Admin");
+  $("#who").textContent = prof.name || prof.email;
+  await loadAll();
+  sb.channel("admin-orders").on("postgres_changes", { event: "*", schema: "public", table: "orders" }, p => {
+    if (p.eventType === "INSERT") toast("Nouvelle commande reçue");
+    clearTimeout(tmr); tmr = setTimeout(loadAll, 600);
+  }).subscribe();
+});
+</script>
+</body>
+</html>
